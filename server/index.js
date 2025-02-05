@@ -489,7 +489,7 @@ io.on("connection", async (socket) => {
     }
 
     try {
-      await consumerData.resume();
+      await consumerData.consumer.resume();
       console.log(`✅ Consumer ${serverConsumerId} resumed successfully.`);
     } catch (error) {
       console.error(`❌ Error resuming consumer ${serverConsumerId}:`, error);

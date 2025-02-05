@@ -14,6 +14,8 @@ const WebRTCManager = () => {
   const consumerTransportsRef = useRef([]);
   const producersRef = useRef({});
   const [forceUpdate, setForceUpdate] = useState(false); // ✅ Added this
+  const localProducerIds = useRef([]);
+  const remoteVideoRef = useRef([]);
 
   const joinRoom = async (e) => {
     e.preventDefault();
@@ -67,7 +69,16 @@ const WebRTCManager = () => {
       console.log("🔵 Fetching existing producers...");
       const existingProducers = await new Promise((resolve) => {
         socket.timeout(5000).emit("getProducers", (err, producerList) => {
-          err ? console.error(err) : resolve(producerList || []);
+          if (err) {
+            console.error(err);
+            resolve([]);
+          } else {
+            // Filter out local producers
+            const remoteProducers = producerList.filter(
+              (producerId) => !localProducerIds.current.includes(producerId)
+            );
+            resolve(remoteProducers);
+          }
         });
       });
 
@@ -174,16 +185,20 @@ const WebRTCManager = () => {
     for (const track of tracks) {
       const producer = await producerTransportRef.current.produce({ track });
       producersRef.current[producer.id] = producer;
+      localProducerIds.current.push(producer.id); // Track local producer IDs
       setProducers((prev) => [...prev, producer.id]);
     }
   };
-
   const signalNewConsumerTransport = useCallback(
     async (producerId) => {
+      if (localProducerIds.current.includes(producerId)) {
+        console.log(`🔄 Producer ${producerId} is local, skipping.`);
+        return;
+      }
+
       console.log(
         `🚀 Attempting to create consumer transport for producer: ${producerId}`
       );
-
       // ✅ Check if a consumer transport already exists
       let transport = consumerTransportsRef.current.find(
         (t) => t.type === "consumer"
@@ -231,39 +246,33 @@ const WebRTCManager = () => {
       );
 
       // ✅ Ensure tracks are added to the same MediaStream
-      let existingStream = remoteStreams.find(
-        (s) => s.id === producerId
-      )?.stream;
-      if (!existingStream) {
-        console.log(`🆕 Creating a new MediaStream for producer ${producerId}`);
-        existingStream = new MediaStream();
-      }
-
-      if (
-        !existingStream
-          .getTracks()
-          .some((track) => track.id === consumer.track.id)
-      ) {
-        existingStream.addTrack(consumer.track);
-      }
-
-      console.log(
-        `✅ Updated MediaStream for producer ${producerId}:`,
-        existingStream.getTracks()
-      );
-
       setRemoteStreams((prev) => {
         let updatedStreams = [...prev];
         const existingIndex = updatedStreams.findIndex(
-          (s) => s.id === producerId
+          (s) => s.id === socket.id
         );
+        let combinedStream =
+          existingIndex !== -1
+            ? updatedStreams[existingIndex].stream
+            : new MediaStream();
+
+        // Add the track to the combined stream if it's not already there
+        if (
+          !combinedStream
+            .getTracks()
+            .some((track) => track.id === consumer.track.id)
+        ) {
+          combinedStream.addTrack(consumer.track);
+        }
+
+        // Update or add the combined stream to remoteStreams
         if (existingIndex !== -1) {
           updatedStreams[existingIndex] = {
-            id: producerId,
-            stream: existingStream,
+            id: socket.id,
+            stream: combinedStream,
           };
         } else {
-          updatedStreams.push({ id: producerId, stream: existingStream });
+          updatedStreams.push({ id: socket.id, stream: combinedStream });
         }
         return updatedStreams;
       });
@@ -353,6 +362,12 @@ const WebRTCManager = () => {
         console.log(`🔄 Producer ${producerId} is already consumed, skipping.`);
         return;
       }
+
+      // Skip if this producer is local
+      if (localProducerIds.current.includes(producerId)) {
+        console.log(`🔄 Producer ${producerId} is local, skipping.`);
+        return;
+      }
       //   console.log(`👥 Current peers:`, Object.keys(peers));
       await signalNewConsumerTransport(producerId);
 
@@ -418,7 +433,7 @@ const VideoComponent = ({ stream, isLocal }) => {
     if (videoRef.current && stream) {
       console.log(
         `🔍 Attaching stream to ${isLocal ? "local" : "remote"} video element`,
-        stream
+        stream.getTracks()
       );
       console.log(`🎥 Stream tracks:`, stream.getTracks());
       stream.getTracks().forEach((track) => {
