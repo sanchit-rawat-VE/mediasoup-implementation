@@ -1,8 +1,8 @@
 import { Server } from "socket.io";
-import mediasoup from "mediasoup";
 import http from "http";
 import express from "express";
 import cors from "cors";
+import mediasoup from "mediasoup"; // Import the entire module
 
 const app = express();
 app.use(cors());
@@ -62,7 +62,10 @@ const mediaCodecs = [
     kind: "video",
     mimeType: "video/VP8",
     clockRate: 90000,
-    parameters: { "x-google-start-bitrate": 1000 },
+    parameters: {
+      "profile-level-id": "42e01f", // Baseline profile
+    },
+    rtcpFeedback: [{ type: "nack" }, { type: "goog-remb" }],
   },
 ];
 
@@ -135,8 +138,6 @@ io.on("connection", (socket) => {
     console.log(`Connecting transport for ${socket.id}`);
     const transport = getTransport(socket.id);
 
-    console.log("transport", transport);
-
     if (!transport) {
       console.error(`No transport found for ${socket.id}`);
       return;
@@ -194,6 +195,24 @@ io.on("connection", (socket) => {
     informConsumers(roomName, socket.id, producer.id);
 
     producer.on("transportclose", () => producer.close());
+    producer.on("close", () => {
+      console.warn(`⚠️ Producer closed: ${producer.id}`);
+    });
+
+    // ✅ Only request keyframe for video producers
+    if (
+      producer.kind === "video" &&
+      typeof producer.requestKeyFrame === "function"
+    ) {
+      setTimeout(() => {
+        console.log("🔄 Requesting keyframe for producer:", producer.id);
+        producer.requestKeyFrame();
+      }, 500);
+    } else {
+      console.log(
+        `⚠️ Keyframe request skipped for producer ${producer.id} (Kind: ${producer.kind})`
+      );
+    }
 
     callback({ id: producer.id, producersExist: producers.length > 1 });
   });
@@ -226,6 +245,11 @@ io.on("connection", (socket) => {
     ) => {
       console.log(`Consuming producer: ${remoteProducerId}`);
 
+      if (remoteProducerId === socket.id) {
+        callback({ error: "Cannot consume own producer" });
+        return;
+      }
+
       const roomName = peers[socket.id].roomName;
       const router = rooms[roomName]?.router;
       const consumerTransport = transports.find(
@@ -241,7 +265,7 @@ io.on("connection", (socket) => {
         const consumer = await consumerTransport.consume({
           producerId: remoteProducerId,
           rtpCapabilities,
-          // paused: true,
+          paused: true,
           appData: { peerId: socket.id }, // Add this line to include peerId
         });
 
@@ -250,6 +274,7 @@ io.on("connection", (socket) => {
         );
 
         await consumer.resume();
+        console.log(`▶️ Consumer ${consumer.id} resumed`);
 
         consumer.on("producerclose", () => {
           console.log("emitting producer closed.");
@@ -266,9 +291,59 @@ io.on("connection", (socket) => {
             rtpParameters: consumer.rtpParameters,
           },
         });
+
+        if (consumer.kind === "video") {
+          setTimeout(() => {
+            console.log("🔄 Requesting keyframe for consumer:", consumer.id);
+            consumer.requestKeyFrame();
+          }, 500);
+        }
       }
     }
   );
+
+  socket.on("request-keyframe", ({ producerId }) => {
+    console.log(`🔄 Received keyframe request for producer: ${producerId}`);
+
+    // Find producer in stored producers array
+    const producerEntry = producers.find((p) => p.producer.id === producerId);
+
+    if (!producerEntry) {
+      console.warn(
+        `⚠️ No valid producer found for keyframe request: ${producerId}`
+      );
+      return;
+    }
+
+    const producer = producerEntry.producer;
+
+    console.log("🔍 Checking producer details:", producer);
+
+    if (!producer || producer.closed) {
+      console.warn(`⚠️ Producer ${producerId} is already closed or undefined.`);
+      return;
+    }
+
+    if (producer.kind !== "video") {
+      console.warn(
+        `⚠️ Skipping keyframe request: Producer ${producerId} is not a video producer.`
+      );
+      return;
+    }
+
+    if (typeof producer.requestKeyFrame === "function") {
+      console.log(`🔄 Requesting keyframe for producer: ${producerId}`);
+      console.log(
+        "🔍 Producer object before keyframe request:",
+        JSON.stringify(producer, null, 2)
+      );
+      producer.requestKeyFrame();
+    } else {
+      console.warn(
+        `⚠️ Producer ${producerId} does not support keyframe requests or is invalid.`
+      );
+    }
+  });
 });
 
 function handleDisconnect(socket) {
@@ -296,7 +371,18 @@ async function createWebRtcTransport(router) {
   const options = {
     // listenIps: [{ ip: "0.0.0.0", announcedIp: "192.168.1.10" }],
     listenInfos: [
-      { ip: "0.0.0.0", announcedIp: "192.168.1.10", portRange: [40000, 49999] },
+      {
+        protocol: "udp",
+        ip: "0.0.0.0",
+        announcedIp: "192.168.1.10",
+        portRange: [40000, 49999],
+      },
+      {
+        protocol: "tcp",
+        ip: "0.0.0.0",
+        announcedIp: "192.168.1.10",
+        portRange: [40000, 49999],
+      },
     ],
     enableUdp: true,
     enableTcp: true,
@@ -304,14 +390,14 @@ async function createWebRtcTransport(router) {
     iceServers: [
       { urls: "stun:stun.l.google.com:19302" },
       { urls: "stun:stun1.l.google.com:19302" },
-      { urls: "stun:100.25.178.223:3478" },
-      {
-        urls: "turn:100.25.178.223:3478",
-        username: "webrtcuser",
-        credential: "@dm!n@789",
-      },
+      // { urls: "stun:100.25.178.223:3478" },
+      // {
+      //   urls: "turn:100.25.178.223:3478",
+      //   username: "webrtcuser",
+      //   credential: "@dm!n@789",
+      // },
     ],
-    iceTransportPolicy: "relay", // ✅ Forces use of TURN relay candidates
+    iceTransportPolicy: "all", // ✅ Forces use of TURN relay candidates
   };
 
   const transport = await router.createWebRtcTransport(options);
@@ -332,6 +418,10 @@ async function createWebRtcTransport(router) {
     console.log(`🧊 New ICE Candidate:`, candidate);
   });
 
+  transport.on("score", (score) => {
+    console.log("Transport score:", score);
+  });
+
   return transport;
 }
 
@@ -343,9 +433,11 @@ function getTransport(socketId) {
 function addProducer(producer, roomName) {
   const peerId = producer.appData.peerId;
   if (!peers[peerId]) {
-    console.error(`Peer with ID ${peerId} not found.`);
+    console.error(`❌ Peer with ID ${peerId} not found when adding producer.`);
     return;
   }
+
+  console.log(`✅ Storing producer ${producer.id} for peer ${peerId}`);
 
   producers.push({ socketId: peerId, producer, roomName });
   peers[peerId].producers.push(producer.id);

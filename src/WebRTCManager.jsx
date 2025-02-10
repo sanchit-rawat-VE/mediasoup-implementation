@@ -15,7 +15,6 @@ const WebRTCManagerr = () => {
   const producerTransportRef = useRef(null);
   const consumerTransportsRef = useRef([]);
   const producersRef = useRef({});
-  const [forceUpdate, setForceUpdate] = useState(false); // ✅ Added this
   const localProducerIds = useRef([]);
   const consumedProducerIds = useRef(new Set()); // Track consumed producer IDs
 
@@ -40,7 +39,6 @@ const WebRTCManagerr = () => {
         });
         setJoined(true);
         await initTransports();
-        // await getLocalStream();
       } catch (error) {
         console.error("Error joining room:", error);
       }
@@ -100,7 +98,6 @@ const WebRTCManagerr = () => {
 
   const createTransport = useCallback(
     async (type) => {
-      console.log("Producer Transport current: ", producerTransportRef.current);
       if (type === "producer" && producerTransportRef.current) {
         console.warn("Producer transport already exists, skipping creation");
         return producerTransportRef.current;
@@ -154,15 +151,6 @@ const WebRTCManagerr = () => {
         }
       });
 
-      transport.on("connectionstatechange", (state) => {
-        console.log(`connection state change: ${state}`);
-      });
-
-      // Inside createTransport function (both producer and consumer)
-      transport.on("icegatheringstatechange", (state) => {
-        console.log(`❄️ ICE Gathering State: ${state}`);
-      });
-
       if (type === "producer") {
         transport.on(
           "produce",
@@ -194,52 +182,71 @@ const WebRTCManagerr = () => {
         video: true,
         audio: true,
       });
+      stream.getTracks().forEach((track) => {
+        track.enabled = true; // Explicitly enable all tracks
+      });
       setLocalStream(stream);
       await produceMedia(stream);
     } catch (err) {
       console.error("Error getting media:", err);
+      alert("Failed to access camera/microphone. Please check permissions.");
+      leaveRoom(); // Reset state
     }
   };
 
   const produceMedia = async (stream) => {
-    console.log("🎥 Local stream tracks:", stream.getTracks());
+    console.log("🎥 Producing media...");
     const tracks = stream.getTracks();
     for (const track of tracks) {
-      console.log("Producer track:", track);
       track.enabled = true;
-      const producer = await producerTransportRef.current.produce({ track });
-      console.log("Producer track on client side", producer.track);
+      const producer = await producerTransportRef.current.produce({
+        track,
+        appData: { source: track.kind },
+      });
+
+      console.log(
+        `✅ Producer created - ID: ${producer.id}, Kind: ${track.kind}`
+      );
+
       producersRef.current[producer.id] = producer;
       localProducerIds.current.push(producer.id); // Track local producer IDs
-      setProducers((prev) => [...prev, producer.id]);
+
+      if (
+        producer.kind === "video" &&
+        typeof producer.requestKeyFrame === "function"
+      ) {
+        setInterval(() => {
+          if (!producer.closed) {
+            console.log("🔄 Requesting keyframe...");
+            producer.requestKeyFrame();
+          }
+        }, 2000);
+      }
     }
   };
 
   const signalNewConsumerTransport = useCallback(
     async (producerId, peerId) => {
-      console.log("inside signalNewConsumerTransport");
+      console.log(`🔵 Setting up consumer for producer ${producerId}`);
+
       if (
         localProducerIds.current.includes(producerId) ||
-        consumedProducerIds.current.has(producerId) // Skip already consumed
+        consumedProducerIds.current.has(producerId)
       ) {
-        console.log(`🔄 Producer ${producerId} is local, skipping.`);
+        console.log(`Skipping self-consumption or already consumed producer.`);
+        return;
+      }
+
+      if (producerId === socket.id) {
+        console.log("Skipping self-consumption");
         return;
       }
       // ✅ Check if a consumer transport already exists
       let transport = consumerTransportsRef.current.find((t) => !t.closed);
 
       if (!transport) {
-        console.log("🔵 No existing consumer transport found, creating one...");
         transport = await createTransport("consumer");
-
-        if (!transport) {
-          console.error("❌ Failed to create consumer transport.");
-          return;
-        }
-
         consumerTransportsRef.current.push(transport);
-      } else {
-        console.log("🔄 Reusing existing consumer transport.");
       }
 
       console.log(
@@ -262,34 +269,21 @@ const WebRTCManagerr = () => {
         producerId: params.producerId,
         kind: params.kind,
         rtpParameters: params.rtpParameters,
+        paused: false, // ✅ Ensure it starts playing
       });
+
+      consumer.track.enabled = true;
+      setTimeout(() => consumer.resume(), 500); // Resume after a short delay
 
       console.log(
         `✅ Consumed track: ${consumer.track.id}, Kind: ${consumer.track.kind}, Enabled: ${consumer.track.enabled}`
       );
-      console.log(
-        `📡 Consumer status: Paused = ${consumer.paused}, ReadyState = ${consumer.track.readyState}`
-      );
 
-      await consumer.resume();
-      console.log(
-        `🟢 Consumer resumed. Checking track: Enabled = ${consumer.track.enabled}, Muted = ${consumer.track.muted}`
-      );
-      // consumer.track.enabled = true;
-
-      setTimeout(async () => {
-        console.log(`⏳ Checking if consumer is still muted after 5s...`);
-        console.log(
-          `🎥 Consumer track status: ${
-            consumer.track.muted ? "Muted" : "Playing"
-          }`
-        );
-
-        if (consumer.track.muted) {
-          console.log(`🚨 Track still muted. Force resuming consumer.`);
-          await consumer.resume();
-        }
-      }, 5000);
+      console.log(`Track initial state: 
+        muted: ${consumer.track.muted}, 
+        enabled: ${consumer.track.enabled}, 
+        readyState: ${consumer.track.readyState}
+        kind: ${consumer.track.kind}`);
 
       console.log(
         `📡 Received track from producer ${producerId}:`,
@@ -298,38 +292,17 @@ const WebRTCManagerr = () => {
 
       consumedProducerIds.current.add(producerId); // Mark as consumed
 
-      // ✅ Ensure tracks are added to the same MediaStream
-      // Add to correct peer's stream
+      // Ensure tracks are added to correct MediaStream
       setRemoteStreams((prev) => {
-        console.log(`🟢 Updating remoteStreams state before:`, prev);
-        // Create a DEEP COPY of the previous state
         const newStreams = { ...prev };
-
-        // Create a NEW MediaStream instance when adding tracks
-        if (!newStreams[peerId]) {
-          newStreams[peerId] = new MediaStream();
-        }
-
-        const existingTracks = newStreams[peerId].getTracks();
-        if (!existingTracks.some((t) => t.id === consumer.track.id)) {
-          // Clone the stream and add the new track
-          console.log(`🟢 Updating remoteStreams state after:`, newStreams);
-
-          newStreams[peerId] = new MediaStream([
-            ...existingTracks,
-            consumer.track,
-          ]);
-        }
-
+        if (!newStreams[peerId]) newStreams[peerId] = new MediaStream();
+        newStreams[peerId].addTrack(consumer.track);
         return newStreams;
       });
 
-      console.log(`▶️ Resuming consumer ${consumer.id}`);
-      await consumer.resume();
-      console.log("consumer", consumer);
-      socket.emit("consumer-resume", {
-        serverConsumerId: params.id,
-      });
+      socket.emit("consumer-resume", { serverConsumerId: params.id });
+
+      socket.emit("request-keyframe", { producerId: consumer.producerId });
     },
     [
       consumerTransportsRef,
@@ -339,6 +312,7 @@ const WebRTCManagerr = () => {
       setRemoteStreams,
     ]
   );
+
   const leaveRoom = () => {
     localStream.getTracks().forEach((track) => track.stop());
     producerTransportRef.current?.close();
@@ -347,6 +321,9 @@ const WebRTCManagerr = () => {
     setJoined(false);
     setLocalStream(null);
     setRemoteStreams([]);
+    localProducerIds.current = []; // Reset local producers
+    consumedProducerIds.current = new Set(); // Reset consumed IDs
+    consumerTransportsRef.current = []; // Clear consumer transports
   };
 
   useEffect(() => {
@@ -476,26 +453,9 @@ const VideoComponent = ({ localStream, remoteStreams }) => {
 
   // Handle remote streams
   useEffect(() => {
-    console.log("🖥 Updating remote video elements:", remoteStreams);
-
     Object.entries(remoteStreams).forEach(([peerId, stream]) => {
-      console.log(
-        `🖥 Assigning remote stream to video element for peer: ${peerId}`
-      );
+      console.log(`🖥 Updating video for ${peerId}`, stream);
       console.log("🔍 Stream Tracks:", stream.getTracks());
-
-      const unmuteAllTracks = (stream) => {
-        stream.getTracks().forEach((track) => {
-          // Check if the track is a video or audio track
-          if (track.kind === "audio" || track.kind === "video") {
-            // Unmute the track by enabling it
-            track.enabled = true;
-          }
-        });
-      };
-
-      // Call the function with your stream
-      unmuteAllTracks(stream);
 
       const videoElement = remoteVideoRefs.current[peerId];
 
@@ -504,9 +464,7 @@ const VideoComponent = ({ localStream, remoteStreams }) => {
         return;
       }
 
-      // 🚀 Force a fresh attachment
-      videoElement.srcObject = null;
-      videoElement.srcObject = new MediaStream(stream.getTracks());
+      videoElement.srcObject = stream;
 
       console.log(
         `🎥 Setting srcObject for ${peerId}:`,
@@ -514,27 +472,17 @@ const VideoComponent = ({ localStream, remoteStreams }) => {
       );
 
       videoElement.onloadedmetadata = () => {
-        videoElement.play().catch((error) => {
-          console.error(`❌ Error playing video for ${peerId}:`, error);
-        });
+        videoElement
+          .play()
+          .catch((error) => console.error("❌ Play error:", error));
       };
-    });
 
-    const forcePlay = () => {
-      Object.values(remoteVideoRefs.current).forEach((video) => {
-        if (video) {
-          video
-            .play()
-            .catch((err) => console.error("🔴 Forced play failed:", err));
-        }
+      stream.getTracks().forEach((track) => {
+        console.log(
+          `Track ID: ${track.id}, Kind: ${track.kind}, Enabled: ${track.enabled}, Muted: ${track.muted}`
+        );
       });
-    };
-
-    document.addEventListener("click", forcePlay);
-
-    return () => {
-      document.removeEventListener("click", forcePlay);
-    };
+    });
   }, [remoteStreams]);
 
   return (
