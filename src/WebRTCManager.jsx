@@ -1,13 +1,15 @@
 import React, { useEffect, useState, useRef, useCallback } from "react";
 import * as mediasoupClient from "mediasoup-client";
-import { useSocket } from "./SocketProvider";
+import { useSocket } from "./components/SocketProvider";
+import "./components/VideoComponent.css"; // Or your chosen CSS method
 
-const WebRTCManager = () => {
+const WebRTCManagerr = () => {
   const socket = useSocket();
   const [roomName, setRoomName] = useState("");
   const [joined, setJoined] = useState(false);
   const [localStream, setLocalStream] = useState(null);
-  const [remoteStreams, setRemoteStreams] = useState([]);
+  const [remoteStreams, setRemoteStreams] = useState({}); // { [peerId]: MediaStream }
+
   const [producers, setProducers] = useState([]);
   const deviceRef = useRef(new mediasoupClient.Device());
   const producerTransportRef = useRef(null);
@@ -15,7 +17,7 @@ const WebRTCManager = () => {
   const producersRef = useRef({});
   const [forceUpdate, setForceUpdate] = useState(false); // ✅ Added this
   const localProducerIds = useRef([]);
-  const remoteVideoRef = useRef([]);
+  const consumedProducerIds = useRef(new Set()); // Track consumed producer IDs
 
   const joinRoom = async (e) => {
     e.preventDefault();
@@ -48,7 +50,7 @@ const WebRTCManager = () => {
   // Fix in initTransports:
   const initTransports = async () => {
     try {
-      console.log("🔵 Creating send transport first...");
+      // console.log("🔵 Creating send transport first...");
       if (!producerTransportRef.current) {
         const producerTransport = await createTransport("producer");
         if (!producerTransport) {
@@ -67,6 +69,7 @@ const WebRTCManager = () => {
       await getLocalStream();
 
       console.log("🔵 Fetching existing producers...");
+
       const existingProducers = await new Promise((resolve) => {
         socket.timeout(5000).emit("getProducers", (err, producerList) => {
           if (err) {
@@ -74,10 +77,12 @@ const WebRTCManager = () => {
             resolve([]);
           } else {
             // Filter out local producers
-            const remoteProducers = producerList.filter(
-              (producerId) => !localProducerIds.current.includes(producerId)
+            const filtered = producerList.filter(
+              (id) =>
+                !localProducerIds.current.includes(id) &&
+                !consumedProducerIds.current.has(id)
             );
-            resolve(remoteProducers);
+            resolve(filtered);
           }
         });
       });
@@ -95,6 +100,7 @@ const WebRTCManager = () => {
 
   const createTransport = useCallback(
     async (type) => {
+      console.log("Producer Transport current: ", producerTransportRef.current);
       if (type === "producer" && producerTransportRef.current) {
         console.warn("Producer transport already exists, skipping creation");
         return producerTransportRef.current;
@@ -112,6 +118,13 @@ const WebRTCManager = () => {
       );
 
       if (error) {
+        if (error === "Transport already exists") {
+          // Find the existing transport and return it
+          const existing = consumerTransportsRef.current.find(
+            (t) => t.consumer === (type === "consumer")
+          );
+          if (existing) return existing;
+        }
         console.error("❌ Error creating WebRTC transport:", error);
         return null;
       }
@@ -139,6 +152,15 @@ const WebRTCManager = () => {
         } catch (error) {
           errback(error);
         }
+      });
+
+      transport.on("connectionstatechange", (state) => {
+        console.log(`connection state change: ${state}`);
+      });
+
+      // Inside createTransport function (both producer and consumer)
+      transport.on("icegatheringstatechange", (state) => {
+        console.log(`❄️ ICE Gathering State: ${state}`);
       });
 
       if (type === "producer") {
@@ -183,26 +205,28 @@ const WebRTCManager = () => {
     console.log("🎥 Local stream tracks:", stream.getTracks());
     const tracks = stream.getTracks();
     for (const track of tracks) {
+      console.log("Producer track:", track);
+      track.enabled = true;
       const producer = await producerTransportRef.current.produce({ track });
+      console.log("Producer track on client side", producer.track);
       producersRef.current[producer.id] = producer;
       localProducerIds.current.push(producer.id); // Track local producer IDs
       setProducers((prev) => [...prev, producer.id]);
     }
   };
+
   const signalNewConsumerTransport = useCallback(
-    async (producerId) => {
-      if (localProducerIds.current.includes(producerId)) {
+    async (producerId, peerId) => {
+      console.log("inside signalNewConsumerTransport");
+      if (
+        localProducerIds.current.includes(producerId) ||
+        consumedProducerIds.current.has(producerId) // Skip already consumed
+      ) {
         console.log(`🔄 Producer ${producerId} is local, skipping.`);
         return;
       }
-
-      console.log(
-        `🚀 Attempting to create consumer transport for producer: ${producerId}`
-      );
       // ✅ Check if a consumer transport already exists
-      let transport = consumerTransportsRef.current.find(
-        (t) => t.type === "consumer"
-      );
+      let transport = consumerTransportsRef.current.find((t) => !t.closed);
 
       if (!transport) {
         console.log("🔵 No existing consumer transport found, creating one...");
@@ -241,44 +265,70 @@ const WebRTCManager = () => {
       });
 
       console.log(
+        `✅ Consumed track: ${consumer.track.id}, Kind: ${consumer.track.kind}, Enabled: ${consumer.track.enabled}`
+      );
+      console.log(
+        `📡 Consumer status: Paused = ${consumer.paused}, ReadyState = ${consumer.track.readyState}`
+      );
+
+      await consumer.resume();
+      console.log(
+        `🟢 Consumer resumed. Checking track: Enabled = ${consumer.track.enabled}, Muted = ${consumer.track.muted}`
+      );
+      // consumer.track.enabled = true;
+
+      setTimeout(async () => {
+        console.log(`⏳ Checking if consumer is still muted after 5s...`);
+        console.log(
+          `🎥 Consumer track status: ${
+            consumer.track.muted ? "Muted" : "Playing"
+          }`
+        );
+
+        if (consumer.track.muted) {
+          console.log(`🚨 Track still muted. Force resuming consumer.`);
+          await consumer.resume();
+        }
+      }, 5000);
+
+      console.log(
         `📡 Received track from producer ${producerId}:`,
         consumer.track
       );
 
+      consumedProducerIds.current.add(producerId); // Mark as consumed
+
       // ✅ Ensure tracks are added to the same MediaStream
+      // Add to correct peer's stream
       setRemoteStreams((prev) => {
-        let updatedStreams = [...prev];
-        const existingIndex = updatedStreams.findIndex(
-          (s) => s.id === socket.id
-        );
-        let combinedStream =
-          existingIndex !== -1
-            ? updatedStreams[existingIndex].stream
-            : new MediaStream();
+        console.log(`🟢 Updating remoteStreams state before:`, prev);
+        // Create a DEEP COPY of the previous state
+        const newStreams = { ...prev };
 
-        // Add the track to the combined stream if it's not already there
-        if (
-          !combinedStream
-            .getTracks()
-            .some((track) => track.id === consumer.track.id)
-        ) {
-          combinedStream.addTrack(consumer.track);
+        // Create a NEW MediaStream instance when adding tracks
+        if (!newStreams[peerId]) {
+          newStreams[peerId] = new MediaStream();
         }
 
-        // Update or add the combined stream to remoteStreams
-        if (existingIndex !== -1) {
-          updatedStreams[existingIndex] = {
-            id: socket.id,
-            stream: combinedStream,
-          };
-        } else {
-          updatedStreams.push({ id: socket.id, stream: combinedStream });
+        const existingTracks = newStreams[peerId].getTracks();
+        if (!existingTracks.some((t) => t.id === consumer.track.id)) {
+          // Clone the stream and add the new track
+          console.log(`🟢 Updating remoteStreams state after:`, newStreams);
+
+          newStreams[peerId] = new MediaStream([
+            ...existingTracks,
+            consumer.track,
+          ]);
         }
-        return updatedStreams;
+
+        return newStreams;
       });
 
+      console.log(`▶️ Resuming consumer ${consumer.id}`);
+      await consumer.resume();
+      console.log("consumer", consumer);
       socket.emit("consumer-resume", {
-        serverConsumerId: params.serverConsumerId,
+        serverConsumerId: params.id,
       });
     },
     [
@@ -289,10 +339,9 @@ const WebRTCManager = () => {
       setRemoteStreams,
     ]
   );
-
   const leaveRoom = () => {
     localStream.getTracks().forEach((track) => track.stop());
-    producerTransportRef.current.close();
+    producerTransportRef.current?.close();
     consumerTransportsRef.current.forEach((transport) => transport.close());
     socket.disconnect();
     setJoined(false);
@@ -320,7 +369,7 @@ const WebRTCManager = () => {
   useEffect(() => {
     if (!socket) return;
 
-    console.log("🔵 Checking socket connection:", socket.connected);
+    // console.log("🔵 Checking socket connection:", socket.connected);
 
     socket.on("connect", () => {
       console.log("✅ Socket connected successfully.");
@@ -343,59 +392,44 @@ const WebRTCManager = () => {
   }, [socket]);
 
   useEffect(() => {
-    if (!socket) {
-      console.warn(
-        "❌ Socket not initialized. Cannot listen for 'new-producer'."
-      );
-      return;
-    }
+    console.log(
+      "🔄 useEffect triggered! Current remoteStreams:",
+      remoteStreams
+    );
+  }, [remoteStreams]);
 
-    console.log("✅ Setting up listener for 'new-producer'...");
+  useEffect(() => {
+    if (!socket) return;
 
-    socket.on("new-producer", async ({ producerId }) => {
-      console.log(
-        `📡 Received 'new-producer' event for producer: ${producerId}`
-      );
+    console.log("Remote Streams", remoteStreams);
+    socket.on("new-producer", async ({ producerId, peerId }) => {
+      console.log(`📡 New producer from peer ${peerId}: ${producerId}`);
 
-      // ✅ Check if this producer ID has already been consumed
-      if (remoteStreams.some((s) => s.id === producerId)) {
-        console.log(`🔄 Producer ${producerId} is already consumed, skipping.`);
+      // Skip if already consuming this producer
+      if (consumedProducerIds.current.has(producerId)) {
+        console.log(`🔄 Already consuming ${producerId}, skipping`);
         return;
       }
 
-      // Skip if this producer is local
-      if (localProducerIds.current.includes(producerId)) {
-        console.log(`🔄 Producer ${producerId} is local, skipping.`);
-        return;
-      }
-      //   console.log(`👥 Current peers:`, Object.keys(peers));
-      await signalNewConsumerTransport(producerId);
-
-      // ✅ Fetch the latest producer list to check if we missed the other track
+      // Fetch latest producers to check for missed tracks
       const producers = await socket.emitWithAck("getProducers");
-      console.log(`📡 Received producer list:`, producers);
 
-      // ✅ Ensure we consume both the audio & video producers
-      for (let otherProducerId of producers) {
-        if (!remoteStreams.some((s) => s.id === otherProducerId)) {
-          console.log(
-            `🔄 Found unconsumed producer: ${otherProducerId}, consuming...`
-          );
-          await signalNewConsumerTransport(otherProducerId);
+      // Consume all relevant producers for this peer
+      for (const otherProducerId of producers) {
+        if (
+          !localProducerIds.current.includes(otherProducerId) &&
+          !consumedProducerIds.current.has(otherProducerId)
+        ) {
+          console.log(`🔄 Consuming ${otherProducerId} from ${peerId}`);
+          await signalNewConsumerTransport(otherProducerId, peerId);
         }
       }
     });
 
     return () => {
-      console.log("🧹 Removing 'new-producer' listener...");
       socket.off("new-producer");
     };
-  }, [socket, signalNewConsumerTransport]);
-
-  useEffect(() => {
-    console.log("🚀 Remote streams updated:", remoteStreams);
-    setForceUpdate((prev) => !prev); // This forces React to re-render
-  }, [remoteStreams]);
+  }, [socket, signalNewConsumerTransport, remoteStreams]);
 
   return (
     <div className="container">
@@ -413,12 +447,11 @@ const WebRTCManager = () => {
         <div>
           <button onClick={leaveRoom}>Leave Room</button>
           <div className="video-container">
-            {localStream && (
-              <VideoComponent stream={localStream} isLocal={true} />
-            )}
-            {remoteStreams.map(({ id, stream }) => (
-              <VideoComponent key={id} stream={stream} />
-            ))}
+            <VideoComponent
+              localStream={localStream}
+              remoteStreams={remoteStreams}
+              isLocal={true}
+            />
           </div>
         </div>
       )}
@@ -426,69 +459,115 @@ const WebRTCManager = () => {
   );
 };
 
-const VideoComponent = ({ stream, isLocal }) => {
-  const videoRef = useRef();
-
+const VideoComponent = ({ localStream, remoteStreams }) => {
+  const localVideoRef = useRef(null);
+  const remoteVideoRefs = useRef({});
+  // Handle local stream
   useEffect(() => {
-    if (videoRef.current && stream) {
-      console.log(
-        `🔍 Attaching stream to ${isLocal ? "local" : "remote"} video element`,
-        stream.getTracks()
-      );
-      console.log(`🎥 Stream tracks:`, stream.getTracks());
-      stream.getTracks().forEach((track) => {
-        console.log(
-          `🎙️ Track kind: ${track.kind}, enabled: ${track.enabled}, readyState: ${track.readyState}`
-        );
-      });
-      videoRef.current.srcObject = stream;
-
-      console.log("videoRef.current.srcObject", videoRef.current.srcObject);
-
-      videoRef.current.onloadedmetadata = () => {
-        console.log("✅ Video metadata loaded, attempting playback...");
-        videoRef.current
-          .play()
-          .then(() => console.log("🎥 Video is playing"))
-          .catch((error) => console.error("❌ Error playing video:", error));
-      };
-
-      // ✅ Quick Fix 1: Force video playback when the user clicks anywhere on the page
-      const forcePlay = () => {
-        if (videoRef.current) {
-          videoRef.current
-            .play()
-            .then(() => console.log("🚀 Forced video playback"))
-            .catch((err) => console.error("❌ Error forcing playback:", err));
-        }
-      };
-
-      document.addEventListener("click", forcePlay);
-
-      setTimeout(() => {
-        console.log(
-          "🔍 Final check: video srcObject",
-          videoRef.current.srcObject
-        );
-      }, 2000);
-
-      return () => {
-        document.removeEventListener("click", forcePlay);
+    if (localStream && localVideoRef.current) {
+      localVideoRef.current.srcObject = localStream;
+      localVideoRef.current.onloadedmetadata = () => {
+        localVideoRef.current.play().catch((error) => {
+          console.error("Error playing local video:", error);
+        });
       };
     }
-  }, [stream]);
+  }, [localStream]);
+
+  // Handle remote streams
+  useEffect(() => {
+    console.log("🖥 Updating remote video elements:", remoteStreams);
+
+    Object.entries(remoteStreams).forEach(([peerId, stream]) => {
+      console.log(
+        `🖥 Assigning remote stream to video element for peer: ${peerId}`
+      );
+      console.log("🔍 Stream Tracks:", stream.getTracks());
+
+      const unmuteAllTracks = (stream) => {
+        stream.getTracks().forEach((track) => {
+          // Check if the track is a video or audio track
+          if (track.kind === "audio" || track.kind === "video") {
+            // Unmute the track by enabling it
+            track.enabled = true;
+          }
+        });
+      };
+
+      // Call the function with your stream
+      unmuteAllTracks(stream);
+
+      const videoElement = remoteVideoRefs.current[peerId];
+
+      if (!videoElement) {
+        console.warn(`⚠️ Video element for peer ${peerId} not found`);
+        return;
+      }
+
+      // 🚀 Force a fresh attachment
+      videoElement.srcObject = null;
+      videoElement.srcObject = new MediaStream(stream.getTracks());
+
+      console.log(
+        `🎥 Setting srcObject for ${peerId}:`,
+        videoElement.srcObject
+      );
+
+      videoElement.onloadedmetadata = () => {
+        videoElement.play().catch((error) => {
+          console.error(`❌ Error playing video for ${peerId}:`, error);
+        });
+      };
+    });
+
+    const forcePlay = () => {
+      Object.values(remoteVideoRefs.current).forEach((video) => {
+        if (video) {
+          video
+            .play()
+            .catch((err) => console.error("🔴 Forced play failed:", err));
+        }
+      });
+    };
+
+    document.addEventListener("click", forcePlay);
+
+    return () => {
+      document.removeEventListener("click", forcePlay);
+    };
+  }, [remoteStreams]);
 
   return (
-    <div className="video-wrapper">
-      <video
-        ref={videoRef}
-        autoPlay
-        playsInline
-        muted={isLocal}
-        style={{ transform: isLocal ? "scaleX(-1)" : "none" }}
-      />
+    <div className="video-container">
+      {/* Local Video */}
+      <div className="video-wrapper local-video">
+        <video
+          ref={localVideoRef}
+          autoPlay
+          muted
+          playsInline
+          className="video-element"
+          style={{ transform: "scaleX(-1)" }}
+        />
+        <div className="video-label">You</div>
+      </div>
+
+      {/* Remote Videos */}
+      {Object.entries(remoteStreams).map(([peerId, stream]) => (
+        <div key={peerId} className="video-wrapper">
+          <video
+            ref={(el) => (remoteVideoRefs.current[peerId] = el)}
+            autoPlay
+            playsInline
+            muted={false}
+            className="video-element"
+            onCanPlay={() => remoteVideoRefs.current[peerId]?.play()}
+          />
+          <div className="video-label">User {peerId.slice(-4)}</div>
+        </div>
+      ))}
     </div>
   );
 };
 
-export default WebRTCManager;
+export default WebRTCManagerr;

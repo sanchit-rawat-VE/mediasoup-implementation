@@ -1,10 +1,10 @@
 import React from "react";
-import WebRTCManager from "./components/WebRTCManager";
+import WebRTCManagerr from "./WebRTCManager";
 
 function App() {
   return (
     <div className="App">
-      <WebRTCManager />
+      <WebRTCManagerr />
     </div>
   );
 }
