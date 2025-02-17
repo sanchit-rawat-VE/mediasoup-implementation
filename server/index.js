@@ -35,8 +35,8 @@ let consumers = [];
 async function createWorker() {
   const worker = await mediasoup.createWorker({
     logLevel: "warn",
-    rtcMinPort: 40000,
-    rtcMaxPort: 49999,
+    rtcMinPort: 49152,
+    rtcMaxPort: 65535,
   });
 
   console.log(`Worker PID: ${worker.pid}`);
@@ -63,9 +63,14 @@ const mediaCodecs = [
     mimeType: "video/VP8",
     clockRate: 90000,
     parameters: {
-      "profile-level-id": "42e01f", // Baseline profile
+      "x-google-start-bitrate": 1000,
     },
-    rtcpFeedback: [{ type: "nack" }, { type: "goog-remb" }],
+  },
+  {
+    kind: "video",
+    mimeType: "video/H264",
+    clockRate: 90000,
+    parameters: { "profile-level-id": "42e01f" },
   },
 ];
 
@@ -88,7 +93,6 @@ io.on("connection", (socket) => {
       producers: [],
       consumers: [],
     };
-
     callback({ rtpCapabilities: router1.rtpCapabilities });
   });
 
@@ -128,7 +132,7 @@ io.on("connection", (socket) => {
 
     // Send candidate to all peers in the room except sender
     rooms[roomName].peers.forEach((peerId) => {
-      if (peerId !== socket.id && peers[peerId]) {
+      if (peerId !== socket.id && peers[peerId]?.socket) {
         peers[peerId].socket.emit("ice-candidate", { candidate });
       }
     });
@@ -171,7 +175,10 @@ io.on("connection", (socket) => {
         (producer) =>
           producer.socketId !== socket.id && producer.roomName === roomName
       )
-      .map((producer) => producer.producer.id);
+      .map((producer) => ({
+        producerId: producer.producer.id.toString(),
+        peerId: producer.socketId.toString(),
+      }));
 
     callback(producerList);
   });
@@ -179,6 +186,14 @@ io.on("connection", (socket) => {
   socket.on("transport-produce", async ({ kind, rtpParameters }, callback) => {
     const transport = getTransport(socket.id);
     if (!transport) return callback({ error: "No transport found" });
+
+    if (kind === "video") {
+      rtpParameters.encodings = [
+        { rid: "q", scalabilityMode: "S1T3" }, // Low Layer
+        { rid: "h", scalabilityMode: "S1T3" }, // Medium Layer
+        { rid: "f", scalabilityMode: "S1T3" }, // High Layer
+      ];
+    }
 
     const producer = await transport.produce({
       kind,
@@ -188,6 +203,13 @@ io.on("connection", (socket) => {
     });
 
     console.log(`✅ Producer created - ID: ${producer.id}, Kind: ${kind}`);
+    console.log(`🔍 Producer paused state: ${producer.paused}`);
+    console.log("Producer Current Layers:", producer.currentLayers);
+
+    if (producer.paused) {
+      console.log(`▶️ Resuming producer ${producer.id}`);
+      await producer.resume();
+    }
 
     const roomName = peers[socket.id].roomName;
     addProducer(producer, roomName);
@@ -204,10 +226,10 @@ io.on("connection", (socket) => {
       producer.kind === "video" &&
       typeof producer.requestKeyFrame === "function"
     ) {
-      setTimeout(() => {
-        console.log("🔄 Requesting keyframe for producer:", producer.id);
-        producer.requestKeyFrame();
-      }, 500);
+      console.log(
+        `🔄 Requesting keyframe immediately for producer: ${producer.id}`
+      );
+      producer.requestKeyFrame();
     } else {
       console.log(
         `⚠️ Keyframe request skipped for producer ${producer.id} (Kind: ${producer.kind})`
@@ -226,6 +248,9 @@ io.on("connection", (socket) => {
       try {
         await consumerEntry.consumer.resume();
         console.log(`✅ Consumer ${serverConsumerId} resumed`);
+        console.log(
+          `Consumer ${serverConsumerId} paused ${consumerEntry.consumer.paused}`
+        );
       } catch (error) {
         console.error(
           `❌ Failed to resume consumer ${serverConsumerId}:`,
@@ -265,7 +290,7 @@ io.on("connection", (socket) => {
         const consumer = await consumerTransport.consume({
           producerId: remoteProducerId,
           rtpCapabilities,
-          paused: true,
+          paused: false,
           appData: { peerId: socket.id }, // Add this line to include peerId
         });
 
@@ -283,6 +308,11 @@ io.on("connection", (socket) => {
 
         addConsumer(consumer, roomName);
 
+        if (consumer.kind === "video") {
+          console.log(`🔄 Requesting keyframe for consumer: ${consumer.id}`);
+          setTimeout(() => consumer.requestKeyFrame(), 500);
+        }
+
         callback({
           params: {
             id: consumer.id,
@@ -291,13 +321,6 @@ io.on("connection", (socket) => {
             rtpParameters: consumer.rtpParameters,
           },
         });
-
-        if (consumer.kind === "video") {
-          setTimeout(() => {
-            console.log("🔄 Requesting keyframe for consumer:", consumer.id);
-            consumer.requestKeyFrame();
-          }, 500);
-        }
       }
     }
   );
@@ -317,7 +340,7 @@ io.on("connection", (socket) => {
 
     const producer = producerEntry.producer;
 
-    console.log("🔍 Checking producer details:", producer);
+    // console.log("🔍 Checking producer details:", producer);
 
     if (!producer || producer.closed) {
       console.warn(`⚠️ Producer ${producerId} is already closed or undefined.`);
@@ -359,8 +382,12 @@ function handleDisconnect(socket) {
 }
 
 async function createRoom(roomName) {
-  if (rooms[roomName]) return rooms[roomName].router;
+  if (rooms[roomName]) {
+    console.log("returning the router");
+    return rooms[roomName].router;
+  }
 
+  console.log("creating a router");
   const router = await worker.createRouter({ mediaCodecs });
   rooms[roomName] = { router, peers: [] };
 
@@ -374,14 +401,12 @@ async function createWebRtcTransport(router) {
       {
         protocol: "udp",
         ip: "0.0.0.0",
-        announcedIp: "192.168.1.10",
-        portRange: [40000, 49999],
+        announcedIp: "44.216.83.223",
       },
       {
         protocol: "tcp",
         ip: "0.0.0.0",
-        announcedIp: "192.168.1.10",
-        portRange: [40000, 49999],
+        announcedIp: "44.216.83.223",
       },
     ],
     enableUdp: true,
@@ -390,14 +415,14 @@ async function createWebRtcTransport(router) {
     iceServers: [
       { urls: "stun:stun.l.google.com:19302" },
       { urls: "stun:stun1.l.google.com:19302" },
-      // { urls: "stun:100.25.178.223:3478" },
-      // {
-      //   urls: "turn:100.25.178.223:3478",
-      //   username: "webrtcuser",
-      //   credential: "@dm!n@789",
-      // },
+      { urls: "stun:44.216.83.223:3478" },
+      {
+        urls: "turn:44.216.83.223:3478",
+        username: "webrtcuser",
+        credential: "@dm!n@789",
+      },
     ],
-    iceTransportPolicy: "all", // ✅ Forces use of TURN relay candidates
+    iceTransportPolicy: "all",
   };
 
   const transport = await router.createWebRtcTransport(options);

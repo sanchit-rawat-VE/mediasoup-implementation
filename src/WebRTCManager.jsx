@@ -85,11 +85,11 @@ const WebRTCManagerr = () => {
         });
       });
 
-      existingProducers.forEach((producerId) => {
+      existingProducers.forEach(({ producerId, peerId }) => {
         console.log(
-          `🔵 Creating consumer transport for producer: ${producerId}`
+          `🔵 Creating consumer transport for producer: ${producerId} from peer: ${peerId}`
         );
-        signalNewConsumerTransport(producerId);
+        signalNewConsumerTransport(producerId, peerId);
       });
     } catch (error) {
       console.error("❌ Error in initTransports:", error);
@@ -117,9 +117,7 @@ const WebRTCManagerr = () => {
       if (error) {
         if (error === "Transport already exists") {
           // Find the existing transport and return it
-          const existing = consumerTransportsRef.current.find(
-            (t) => t.consumer === (type === "consumer")
-          );
+          const existing = consumerTransportsRef.current.find((t) => !t.closed);
           if (existing) return existing;
         }
         console.error("❌ Error creating WebRTC transport:", error);
@@ -127,6 +125,8 @@ const WebRTCManagerr = () => {
       }
 
       console.log("✅ Transport Params received:", params);
+
+      // check if the device can produce
 
       const transport =
         type === "producer"
@@ -155,6 +155,9 @@ const WebRTCManagerr = () => {
         transport.on(
           "produce",
           async ({ kind, rtpParameters }, callback, errback) => {
+            console.log(
+              `inside transport produce kind = ${kind} and rtpParams = ${rtpParameters} `
+            );
             try {
               const { id } = await socket.emitWithAck("transport-produce", {
                 kind,
@@ -199,10 +202,26 @@ const WebRTCManagerr = () => {
     const tracks = stream.getTracks();
     for (const track of tracks) {
       track.enabled = true;
-      const producer = await producerTransportRef.current.produce({
+      let producerOptions = {
         track,
         appData: { source: track.kind },
-      });
+      };
+
+      // Enable Simulcast only for video
+      if (track.kind === "video") {
+        producerOptions.encodings = [
+          { rid: "q", scaleResolutionDownBy: 4, maxBitrate: 100000 }, // Low Quality
+          { rid: "h", scaleResolutionDownBy: 2, maxBitrate: 500000 }, // Medium Quality
+          { rid: "f", scaleResolutionDownBy: 1, maxBitrate: 1200000 }, // High Quality
+        ];
+        producerOptions.codecOptions = {
+          videoGoogleStartBitrate: 1000, // Start at 1000 kbps
+        };
+      }
+
+      const producer = await producerTransportRef.current.produce(
+        producerOptions
+      );
 
       console.log(
         `✅ Producer created - ID: ${producer.id}, Kind: ${track.kind}`
@@ -273,10 +292,18 @@ const WebRTCManagerr = () => {
       });
 
       consumer.track.enabled = true;
-      setTimeout(() => consumer.resume(), 500); // Resume after a short delay
+      consumer.track.onunmute = () => {
+        console.log(`🔊 Track ${consumer.track.id} unmuted`);
+      };
+
+      setTimeout(() => {
+        console.log(`▶️ Resuming consumer ${consumer.id}`);
+        consumer.resume();
+        consumer.track.enabled = true; // ✅ Force enable
+      }, 500);
 
       console.log(
-        `✅ Consumed track: ${consumer.track.id}, Kind: ${consumer.track.kind}, Enabled: ${consumer.track.enabled}`
+        `✅ Consumed track: ${consumer.track.id}, Kind: ${consumer.track.kind}, Enabled: ${consumer.track.enabled}, Muted: ${consumer.track.muted}`
       );
 
       console.log(`Track initial state: 
@@ -383,24 +410,30 @@ const WebRTCManagerr = () => {
       console.log(`📡 New producer from peer ${peerId}: ${producerId}`);
 
       // Skip if already consuming this producer
-      if (consumedProducerIds.current.has(producerId)) {
-        console.log(`🔄 Already consuming ${producerId}, skipping`);
+      if (consumedProducerIds.current.has(`${peerId}-${producerId}`)) {
+        console.log(
+          `🔄 Already consuming ${producerId} from ${peerId}, skipping`
+        );
         return;
       }
 
+      // Mark as consumed per peer
+      consumedProducerIds.current.add(`${peerId}-${producerId}`);
+
       // Fetch latest producers to check for missed tracks
       const producers = await socket.emitWithAck("getProducers");
+      const filtered = producers.filter(
+        (id) =>
+          !localProducerIds.current.includes(id) &&
+          !consumedProducerIds.current.has(id)
+      );
 
-      // Consume all relevant producers for this peer
-      for (const otherProducerId of producers) {
-        if (
-          !localProducerIds.current.includes(otherProducerId) &&
-          !consumedProducerIds.current.has(otherProducerId)
-        ) {
-          console.log(`🔄 Consuming ${otherProducerId} from ${peerId}`);
-          await signalNewConsumerTransport(otherProducerId, peerId);
-        }
-      }
+      filtered.forEach(({ producerId, peerId }) => {
+        console.log(
+          `🔵 Creating consumer transport for producer: ${producerId} from peer: ${peerId}`
+        );
+        signalNewConsumerTransport(producerId, peerId);
+      });
     });
 
     return () => {
@@ -455,7 +488,7 @@ const VideoComponent = ({ localStream, remoteStreams }) => {
   useEffect(() => {
     Object.entries(remoteStreams).forEach(([peerId, stream]) => {
       console.log(`🖥 Updating video for ${peerId}`, stream);
-      console.log("🔍 Stream Tracks:", stream.getTracks());
+      console.log("🔍 Remote Stream Tracks:", stream.getTracks());
 
       const videoElement = remoteVideoRefs.current[peerId];
 
@@ -478,6 +511,13 @@ const VideoComponent = ({ localStream, remoteStreams }) => {
       };
 
       stream.getTracks().forEach((track) => {
+        track.onunmute = () => {
+          console.log(`🔊 Track ${track.id} unmuted`);
+          videoElement.play();
+        };
+        track.onmute = () => {
+          console.log(`🔇 Track ${track.id} muted`);
+        };
         console.log(
           `Track ID: ${track.id}, Kind: ${track.kind}, Enabled: ${track.enabled}, Muted: ${track.muted}`
         );
